@@ -168,7 +168,7 @@ def _to_kr_date_str(ts) -> str:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yfinance_prices(ticker: str, start_iso: str, end_iso: str, lookback_days: int = 40):
+def fetch_yfinance_prices(ticker: str, start_iso: str, end_iso: str, lookback_days: int = 120):
     """Yahoo Finance에서 일별 종가를 받아온다. 시작일 이전 lookback_days만큼 더 받아와서
     MA(5)/MA(20)/RSI(14)가 첫날부터 실제 과거 시세로 정상 warm-up 되게 한다(내장 데이터의
     역산 워밍업이 필요 없어짐 — Yahoo가 진짜 과거 시세를 갖고 있으므로).
@@ -307,10 +307,12 @@ df_base["MA(5)"] = df_base["종가"].rolling(5).mean()
 df_base["MA(20)"] = df_base["종가"].rolling(20).mean()
 
 delta = df_base["종가"].diff()
-# min_periods=1: 진짜 사이트는 2026-01-02 이전 실제 시세로 RSI가 이미 워밍업된 상태라 값이 있지만,
-# 우리는 그 이전 시세를 모르므로 "그 시점까지 있는 데이터만으로" 계산 — 초반 며칠은 근사치입니다.
-gain = (delta.where(delta > 0, 0)).rolling(14, min_periods=1).mean()
-loss = (-delta.where(delta < 0, 0)).rolling(14, min_periods=1).mean()
+# Wilder 방식(지수平활) RSI로 변경 — 대부분의 실전 차트/사이트가 쓰는 표준 RSI 공식.
+# 단순 rolling(14) 평균은 site의 실제 RSI값과 계속 어긋나는 게 확인되어 교체함.
+# alpha=1/14, adjust=False가 표준 Wilder smoothing과 동일. 워밍업(가격 이력)이 길수록 더 정확해짐
+# — Yahoo Finance 실시간 조회는 이를 위해 시작일보다 충분히 이전부터 데이터를 받아온다(아래 lookback_days).
+gain = delta.where(delta > 0, 0.0).ewm(alpha=1 / 14, adjust=False, min_periods=1).mean()
+loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1 / 14, adjust=False, min_periods=1).mean()
 rs = gain / loss
 df_base["RSI"] = 100 - (100 / (1 + rs))
 df_base["RSI"] = df_base["RSI"].fillna(50)
