@@ -445,9 +445,11 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
                 if idx > 0 and prev_close > prev_ma5:
                     t1_delay = True
 
-            if expired and not hit_target:
-                # 만기(MOC) 강제청산. (참고: "만기+목표가도달+1티어보류"가 겹치는 예외 케이스는
-                # 실제 사이트 로그 대조 결과 이 조건이 가장 근접하게 재현됨 — 대화 내 검증 기록 참고)
+            if expired and (not hit_target or t1_delay):
+                # 만기(MOC)는 목표가 도달 여부와 무관하게 발동. 다만 "목표가 도달 + 1티어 매도보류"가
+                # 겹치는 경우, 매도보류가 막고 있는 상황을 만기가 예외적으로 뚫고 강제청산한다(매뉴얼
+                # "1티어 매도보류(MOC 제외)" 규정 — MOC는 이 보류의 적용 대상에서 제외됨을 의미).
+                # 실제 사이트 로그(01-12 매수 T1 → 01-23 공T1MOC)로 검증된 동작.
                 moc_candidates.append(pos)
             elif hit_target and not t1_delay:
                 loc_candidates.append(pos)
