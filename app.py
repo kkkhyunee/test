@@ -406,6 +406,8 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
     peak_equity = start_capital
     att_weight = 1.0 / att_splits
     def_weights = parse_weight_vector(def_weight_text, def_splits)
+    prev_mode = None
+    prev_total_equity = start_capital
 
     for idx, row in df_slice.iterrows():
         date = row["날짜"]
@@ -419,9 +421,14 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
         prev_sum_def = row["방어_직전합"]
 
         mode = determine_mode(date, close, ma20)
+        is_mode_transition = prev_mode is not None and mode != prev_mode
 
         for pos in open_positions:
             pos["hold_days"] += 1
+
+        cash_at_day_start = cash  # 모드 전환일에는 "그날 매도대금"이 아니라 전일 마감 현금 기준으로
+        # 새 모드의 매수 예산을 잡는다(전환일에 한해 검증됨 — 같은 모드 내 매도 당일 재매수는
+        # 그날 매도대금을 포함한 현금을 그대로 씀).
 
         # ---- 1. 매도 판정 -------------------------------------------------
         moc_candidates = []   # (pos, forced_reason)
@@ -459,6 +466,7 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
         sell_qty_today = 0
         sell_amount_today = 0.0
         sell_pnl_today = 0.0
+        sell_cost_today = 0.0
         sell_cond_today = []
         sold_ids = set()
 
@@ -482,6 +490,7 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
             sell_qty_today += pos["shares"]
             sell_amount_today += sell_val
             sell_pnl_today += pnl
+            sell_cost_today += cost_val
             reason = "MOC만기" if pos in moc_candidates else "익절"
             sell_cond_today.append(f"T{pos['tier']}{pos['mode'][0]} {reason}")
             sold_ids.add(id(pos))
@@ -505,14 +514,27 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
 
         buy_qty_today = 0
         buy_amount_today = 0.0
+        buy_limit_display = None
+        budget_display = None
+        weight_pct_display = None
+        tier_label_display = None
+        sell_pct_display = None
+        max_hold_display = None
 
         if curr_tier <= max_splits and idx > 0:
             # idx==0(첫날)은 "전일" 데이터가 없어 매수 자체가 발생하지 않음 (사이트 로그와 일치)
-            curr_equity = cash + sum(p["shares"] * close for p in open_positions)
             weights = [att_weight] * att_splits if mode == "공격" else def_weights
             remaining_weight_sum = sum(weights[curr_tier - 1:])
             next_weight = weights[curr_tier - 1] if curr_tier - 1 < len(weights) else weights[-1]
-            budget = cash * (next_weight / remaining_weight_sum) if remaining_weight_sum > 0 else 0
+            budget = (
+                (cash_at_day_start if is_mode_transition else cash)
+                * (next_weight / remaining_weight_sum)
+                if remaining_weight_sum > 0
+                else 0
+            )
+            budget = min(budget, cash)  # 실제 쓸 수 있는 현금(오늘 매도대금 포함)을 넘지는 못함
+            budget_display = budget
+            weight_pct_display = next_weight * 100
 
             if mode == "공격":
                 fi = prev_close - prev_prev_close  # Fi = 전일 종가 등락 부호(전전일 대비)
@@ -525,6 +547,7 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
                 p2 = prev_close * (1 + def_buy_cond2 / 100.0)
                 cands = [v for v in [p1, p2] if not np.isnan(v)]
                 buy_limit = floor_2(min(cands)) if cands else close
+            buy_limit_display = buy_limit
 
             # LOC 매수: 종가가 지정가(buy_limit) 이하일 때만 체결. 수량은 지정가 기준으로 보수적으로
             # 산정하고(예산 초과 방지), 실제 체결/지불은 그날 종가로 이뤄짐(사이트 로그로 검증됨).
@@ -538,6 +561,12 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
                         cash -= cost
                         buy_qty_today = shares
                         buy_amount_today = cost
+                        tier_label_display = f"{'공' if mode == '공격' else '방'}T{curr_tier}"
+                        if mode == "공격":
+                            sell_pct_display = attack_sell_pct(rsi, att_sell_min, att_sell_max, att_sell_a) * 100
+                            max_hold_display = attack_hold_days(rsi, att_hold_min, att_hold_max, att_hold_a)
+                        else:
+                            max_hold_display = def_max_hold
                         open_positions.append(
                             {
                                 "tier": curr_tier,
@@ -564,23 +593,40 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
         drawdown = ((total_equity - peak_equity) / peak_equity) * 100
         cum_return = ((total_equity - start_capital) / start_capital) * 100
         cash_ratio = (cash / total_equity) * 100 if total_equity > 0 else 0
+        change_pct = ((close - prev_close) / prev_close * 100) if idx > 0 and prev_close else 0.0
+        asset_change_pct = (
+            ((total_equity - prev_total_equity) / prev_total_equity * 100) if prev_total_equity else 0.0
+        )
+        day_trade_return_pct = (sell_pnl_today / sell_cost_today * 100) if sell_cost_today > 0 else None
 
+        # 실제 사이트 매매로그와 같은 순서/이름으로 정렬 — 캡처와 나란히 비교하기 쉽도록.
         history.append(
             {
                 "날짜": date,
                 "종가": close,
+                "등락": f"{change_pct:.2f}%",
                 "MA(5)": round(ma5, 2),
-                "RSI": round(rsi, 1),
+                "일RSI": round(rsi, 1),
                 "모드": mode,
-                "실매수수량": buy_qty_today if buy_qty_today > 0 else "-",
-                "실매수금액": f"{buy_amount_today:,.2f}" if buy_amount_today > 0 else "-",
+                "FI": ("+" if change_pct >= 0 else "-") if idx > 0 else "-",
+                "매도%": f"{sell_pct_display:.2f}%" if sell_pct_display is not None else "-",
+                "매수조건": buy_limit_display if buy_limit_display is not None else "-",
+                "매수할당": round(budget_display, 2) if budget_display else "-",
+                "실매수비중": f"{weight_pct_display:.1f}%" if weight_pct_display is not None else "-",
+                "매수티어": tier_label_display if tier_label_display else "-",
+                "실매수금": f"{buy_amount_today:,.2f}" if buy_amount_today > 0 else "-",
+                "매수량": buy_qty_today if buy_qty_today > 0 else "-",
+                "보유": max_hold_display if max_hold_display is not None else "-",
                 "매도조건": ", ".join(sell_cond_today) if sell_cond_today else "-",
-                "실매도수량": sell_qty_today if sell_qty_today > 0 else "-",
-                "매도금액": f"{sell_amount_today:,.2f}" if sell_amount_today > 0 else "-",
+                "실매도금": f"{sell_amount_today:,.2f}" if sell_amount_today > 0 else "-",
+                "매도량": sell_qty_today if sell_qty_today > 0 else "-",
                 "손익": f"{sell_pnl_today:,.2f}" if sell_pnl_today != 0 else "-",
+                "수익률": f"{day_trade_return_pct:.2f}%" if day_trade_return_pct is not None else "-",
                 "보유수량": total_shares,
                 "평단가": round(avg_price, 2) if avg_price > 0 else "-",
+                "평가금": round(pos_val, 2),
                 "총자산": round(total_equity, 2),
+                "자산변동": f"{asset_change_pct:.2f}%",
                 "누적수익률": f"{cum_return:.2f}%",
                 "DD": f"{drawdown:.2f}%",
                 "현금": round(cash, 2),
@@ -588,9 +634,11 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
                 "미실현손익": round(unrealized_pnl, 2),
             }
         )
+        prev_mode = mode
+        prev_total_equity = total_equity
 
     df_hist = pd.DataFrame(history)
-    for col in ["실매수수량", "실매도수량", "평단가"]:
+    for col in ["매수량", "매도량", "평단가", "매수조건", "매수할당", "매수티어", "보유"]:
         df_hist[col] = df_hist[col].astype(str)
     df_trades = pd.DataFrame(trades)
     return df_hist, df_trades
@@ -622,7 +670,7 @@ daily_ret = equity_series.pct_change().dropna()
 sharpe = (daily_ret.mean() / daily_ret.std() * (252 ** 0.5)) if daily_ret.std() > 0 else float("nan")
 calmar = (cagr_pct / abs(mdd)) if mdd != 0 else float("nan")
 
-buy_days = (df_result["실매수수량"] != "-").sum()
+buy_days = (df_result["매수량"] != "-").sum()
 buy_fill_pct = buy_days / n_days * 100 if n_days else 0
 final_unrealized = float(df_result["미실현손익"].iloc[-1])
 final_cash_ratio = df_result["현금비중"].iloc[-1]
@@ -714,5 +762,10 @@ with tab_dash:
 with tab_log:
     st.markdown(f"### 📝 매매로그 ({start_date} ~ {end_date})")
     st.caption(_mode_src_note)
+    st.caption(
+        "실제 사이트 매매로그와 같은 열 순서·이름으로 맞췄습니다. "
+        "다만 MA(n)·wRSI·잉여금은 정확한 산출식이 확인되지 않아 표에서 뺐습니다 "
+        "(모드 판정에만 쓰이는 값이라 '모드값 입력' 탭으로 대체 가능)."
+    )
     st.dataframe(df_result, use_container_width=True, hide_index=True, height=700)
 
