@@ -397,8 +397,11 @@ def determine_mode(date, close, ma20):
     return "공격" if (not np.isnan(ma20) and close >= ma20) else "방어"
 
 
-def run_backtest(df_slice: pd.DataFrame, start_capital: float):
-    df_slice = df_slice.reset_index(drop=True)
+def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capital: float):
+    """df_full: 전체(워밍업 포함) 시세 DataFrame. start_idx~end_idx가 실제 시뮬레이션(표시) 구간이고,
+    그 이전 행은 '전일 종가' 등 조회에만 쓰인다 — 사용자가 중간 날짜(예: 3월)부터 시작해도
+    그 이전 실제 시세가 있으면 첫날부터 정상적으로 매수 판단이 이뤄진다(사이트 로그로 확인된 동작)."""
+    df_full = df_full.reset_index(drop=True)
     cash = start_capital
     open_positions = []  # list of dict: tier, shares, buy_price, mode, hold_days, buy_rsi
     history = []
@@ -409,15 +412,16 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
     prev_mode = None
     prev_total_equity = start_capital
 
-    for idx, row in df_slice.iterrows():
+    for idx in range(start_idx, end_idx + 1):
+        row = df_full.loc[idx]
         date = row["날짜"]
         close = row["종가"]
         ma5 = row["MA(5)"] if not np.isnan(row["MA(5)"]) else close
         ma20 = row["MA(20)"]
         rsi = row["RSI"]
-        prev_close = df_slice.loc[idx - 1, "종가"] if idx > 0 else close
-        prev_prev_close = df_slice.loc[idx - 2, "종가"] if idx > 1 else prev_close
-        prev_ma5 = df_slice.loc[idx - 1, "MA(5)"] if idx > 0 else ma5
+        prev_close = df_full.loc[idx - 1, "종가"] if idx > 0 else close
+        prev_prev_close = df_full.loc[idx - 2, "종가"] if idx > 1 else prev_close
+        prev_ma5 = df_full.loc[idx - 1, "MA(5)"] if idx > 0 else ma5
         prev_sum_def = row["방어_직전합"]
 
         mode = determine_mode(date, close, ma20)
@@ -522,7 +526,8 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
         max_hold_display = None
 
         if curr_tier <= max_splits and idx > 0:
-            # idx==0(첫날)은 "전일" 데이터가 없어 매수 자체가 발생하지 않음 (사이트 로그와 일치)
+            # idx==0은 데이터 전체의 첫날(그 이전 시세가 아예 없음)이라 매수가 발생하지 않음.
+            # 사용자가 중간 날짜부터 시작해도 그 이전 실제 시세가 있으면(idx>0) 첫날부터 매수 가능.
             weights = [att_weight] * att_splits if mode == "공격" else def_weights
             remaining_weight_sum = sum(weights[curr_tier - 1:])
             next_weight = weights[curr_tier - 1] if curr_tier - 1 < len(weights) else weights[-1]
@@ -649,9 +654,8 @@ def run_backtest(df_slice: pd.DataFrame, start_capital: float):
 # ────────────────────────────────────────────────────────────────
 s_idx = all_dates.index(start_date) + N_WARMUP
 e_idx = all_dates.index(end_date) + N_WARMUP
-df_target = df_base.iloc[s_idx : e_idx + 1].copy()
 
-df_result, df_trades = run_backtest(df_target, init_cap)
+df_result, df_trades = run_backtest(df_base, s_idx, e_idx, init_cap)
 
 # ---- 지표 계산 -------------------------------------------------------
 final_eq = float(df_result["총자산"].iloc[-1])
