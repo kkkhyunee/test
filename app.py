@@ -40,6 +40,7 @@ import pandas as pd
 import numpy as np
 import math
 import io
+import datetime as _dt
 
 st.set_page_config(page_title="2026 SOXL 듀얼스나이퍼 동적 백테스트", layout="wide")
 st.markdown(
@@ -103,6 +104,12 @@ def floor_2(x: float) -> float:
 def ceil_2(x: float) -> float:
     """매도조건가: 종가 기준 소수점 2자리에서 올림"""
     return math.ceil(x * 100) / 100
+
+
+def label_to_date(label: str) -> _dt.date:
+    """'26-05-01 금' 형태의 날짜 라벨을 date 객체로 변환 (달력 위젯용)."""
+    ymd = label.split(" ")[0]
+    return _dt.datetime.strptime(ymd, "%y-%m-%d").date()
 
 
 def clip01(v: float) -> float:
@@ -322,9 +329,32 @@ mode_override = _mode_preview
 with st.sidebar.form("bt_form"):
     st.markdown("### 📅 백테스트 기간 설정")
     all_dates = df_base["날짜"].tolist()[N_WARMUP:]  # 워밍업 날짜는 선택 목록에서 제외
-    start_date, end_date = st.select_slider(
-        "시작일과 종료일을 선택하세요", options=all_dates, value=(all_dates[0], all_dates[-1])
-    )
+    all_dates_real = [label_to_date(d) for d in all_dates]
+    date_to_label = dict(zip(all_dates_real, all_dates))
+    min_d, max_d = all_dates_real[0], all_dates_real[-1]
+
+    dcol1, dcol2 = st.columns(2)
+    with dcol1:
+        start_picked = st.date_input("시작일", value=min_d, min_value=min_d, max_value=max_d)
+    with dcol2:
+        end_picked = st.date_input("종료일", value=max_d, min_value=min_d, max_value=max_d)
+
+    def _snap(d, forward: bool):
+        if d in date_to_label:
+            return d
+        cands = [x for x in all_dates_real if (x >= d if forward else x <= d)]
+        if cands:
+            return min(cands) if forward else max(cands)
+        return min_d if forward else max_d
+
+    start_snapped = _snap(start_picked, forward=True)
+    end_snapped = _snap(end_picked, forward=False)
+    if start_snapped > end_snapped:
+        start_snapped, end_snapped = end_snapped, start_snapped
+    if start_snapped != start_picked or end_snapped != end_picked:
+        st.caption("⚠️ 휴장일이 포함돼 있어 가장 가까운 거래일로 맞췄습니다.")
+    start_date = date_to_label[start_snapped]
+    end_date = date_to_label[end_snapped]
 
     st.markdown("---")
     st.markdown("### ⚙️ 공통 파라미터")
