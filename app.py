@@ -487,6 +487,7 @@ def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capi
                 # → MOC(만기 강제청산)는 예외, 정상 익절(LOC) 매도가 보류 대상.
                 if idx > 0 and prev_close > prev_ma5:
                     t1_delay = True
+            pos["_t1_paused_today"] = t1_delay  # 방어모드 전량매도 스윕에서 제외 여부 판단에 재사용
 
             if expired and (not hit_target or t1_delay):
                 # 만기(MOC)는 목표가 도달 여부와 무관하게 발동. 다만 "목표가 도달 + 1티어 매도보류"가
@@ -509,12 +510,10 @@ def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capi
             targets = moc_candidates
         else:
             targets = loc_candidates if not apply_moc_priority else loc_candidates
-
-        # 방어모드는 목표가 도달시 "전량"(방어 포지션 전부) 동시청산
-        def_hit_all = any(p["mode"] == "방어" for p in targets) and not moc_candidates
-        if def_hit_all:
-            extra_def = [p for p in open_positions if p["mode"] == "방어" and p not in targets]
-            targets = targets + extra_def
+        # (방어모드 목표가 도달 시 "전량매도"는 위 루프에서 이미 처리됨 — 방어 매도 임계가
+        # 모든 방어 포지션에 동일하게 적용되므로 hit_target도 동시에 True가 되고, 1티어 매도보류가
+        # 걸린 포지션만 자연스럽게 제외된다. 예전엔 여기서 방어 포지션을 통째로 추가로 쓸어담았는데,
+        # 그러면 매도보류 중인 1티어까지 강제로 팔려버려 실제 사이트 로그와 달라 제거함.)
 
         for pos in targets:
             sell_val = pos["shares"] * close * (1 - fee_pct)
