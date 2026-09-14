@@ -40,6 +40,7 @@ import pandas as pd
 import numpy as np
 import math
 import io
+import os
 import datetime as _dt
 
 st.set_page_config(page_title="2026 SOXL 듀얼스나이퍼 동적 백테스트", layout="wide")
@@ -258,24 +259,67 @@ def parse_pasted_mode(text: str):
     return dict(zip(parsed["날짜"], parsed["모드"]))
 
 
+MODE_CACHE_PATH = "saved_mode_data.csv"  # 서버(배포 인스턴스)에 저장 — 재배포/재시작 시 초기화될 수 있음
+
+
+def load_cached_mode():
+    if not os.path.exists(MODE_CACHE_PATH):
+        return None, None
+    try:
+        df = pd.read_csv(MODE_CACHE_PATH, dtype=str)
+        if df.shape[1] < 2:
+            return None, None
+        d = dict(zip(df.iloc[:, 0], df.iloc[:, 1]))
+        ts = _dt.datetime.fromtimestamp(os.path.getmtime(MODE_CACHE_PATH)).strftime("%Y-%m-%d %H:%M")
+        return d, ts
+    except Exception:
+        return None, None
+
+
+def save_cached_mode(mode_dict: dict):
+    pd.DataFrame({"날짜": list(mode_dict.keys()), "모드": list(mode_dict.values())}).to_csv(
+        MODE_CACHE_PATH, index=False
+    )
+
+
 with tab_mode:
     st.markdown("#### 🔒 실제 사이트 모드값(공격/방어) 붙여넣기")
     st.markdown(
         "모드 전환 조건 자체가 매뉴얼상 **비공개**라 정확히 재현할 수 없습니다. "
         "실제 백테스트 사이트의 **매매로그**에서 `날짜`, `모드` 두 열을 그대로 드래그해 복사(Ctrl+C)한 뒤, "
-        "아래 상자에 붙여넣으면(Ctrl+V) 그 값을 그대로 사용합니다. "
+        "아래 상자에 붙여넣으면(Ctrl+V) **자동으로 서버에 저장**되어, 다음부터는 다시 붙여넣지 않아도 "
+        "계속 이 값을 씁니다. 값이 바뀌었을 때만 새로 붙여넣으면 덮어씁니다. "
         "(Fi값은 넣을 필요 없습니다 — 매수 로직 안에서 자동 계산됩니다.)"
     )
+    _cached_mode, _cached_ts = load_cached_mode()
     mode_paste = st.text_area(
-        "여기에 붙여넣기 (예: `26-01-02 금␉공격` 한 줄씩, 헤더 줄이 섞여도 됩니다)",
+        "여기에 붙여넣기 (비워두면 저장된 값을 계속 씁니다. 새로 붙여넣으면 저장된 값을 덮어씁니다)",
         value="",
         height=180,
         key="mode_paste",
         placeholder="26-01-02 금\t공격\n26-01-05 월\t공격\n26-01-06 화\t방어\n...",
     )
-    _mode_preview = parse_pasted_mode(mode_paste)
+    _pasted_now = parse_pasted_mode(mode_paste)
+
+    if _pasted_now:
+        # 새로 붙여넣은 값이 있으면 저장(덮어쓰기)하고 그걸 사용
+        save_cached_mode(_pasted_now)
+        _mode_preview = _pasted_now
+        st.success(f"✅ 새로 붙여넣은 {len(_mode_preview)}개 날짜를 서버에 저장하고 적용했습니다.")
+    elif _cached_mode:
+        _mode_preview = _cached_mode
+        st.success(f"✅ 저장된 모드값 사용 중 — {len(_mode_preview)}개 날짜 (마지막 저장: {_cached_ts})")
+        if st.button("🗑️ 저장된 모드값 삭제"):
+            try:
+                os.remove(MODE_CACHE_PATH)
+                st.rerun()
+            except Exception:
+                pass
+    else:
+        _mode_preview = None
+        st.info("아직 저장된 값이 없습니다 — 값이 없으면 사이드바의 '자동(종가 vs MA20)' 판정을 사용합니다.")
+
     if _mode_preview:
-        st.success(f"✅ {len(_mode_preview)}개 날짜의 모드값을 인식했습니다.")
         st.dataframe(
             pd.DataFrame(
                 {"날짜": list(_mode_preview.keys()), "모드": list(_mode_preview.values())}
@@ -284,8 +328,6 @@ with tab_mode:
             hide_index=True,
             height=300,
         )
-    else:
-        st.info("아직 붙여넣은 값이 없습니다 — 값이 없으면 사이드바의 '자동(종가 vs MA20)' 판정을 사용합니다.")
 
 
 if price_file is not None:
