@@ -287,29 +287,45 @@ with tab_mode:
     st.markdown(
         "모드 전환 조건 자체가 매뉴얼상 **비공개**라 정확히 재현할 수 없습니다. "
         "실제 백테스트 사이트의 **매매로그**에서 `날짜`, `모드` 두 열을 그대로 드래그해 복사(Ctrl+C)한 뒤, "
-        "아래 상자에 붙여넣으면(Ctrl+V) **자동으로 서버에 저장**되어, 다음부터는 다시 붙여넣지 않아도 "
-        "계속 이 값을 씁니다. 값이 바뀌었을 때만 새로 붙여넣으면 덮어씁니다. "
+        "아래 상자에 붙여넣고 버튼을 누르면 서버에 저장되어, 다음부터는 다시 붙여넣지 않아도 "
+        "계속 이 값을 씁니다. "
         "(Fi값은 넣을 필요 없습니다 — 매수 로직 안에서 자동 계산됩니다.)"
     )
     _cached_mode, _cached_ts = load_cached_mode()
     mode_paste = st.text_area(
-        "여기에 붙여넣기 (비워두면 저장된 값을 계속 씁니다. 새로 붙여넣으면 저장된 값을 덮어씁니다)",
+        "여기에 붙여넣기 (새로 갱신할 날짜만 일부만 붙여넣어도 됩니다 — 아래 '추가/갱신'으로 저장하세요)",
         value="",
         height=180,
         key="mode_paste",
-        placeholder="26-01-02 금\t공격\n26-01-05 월\t공격\n26-01-06 화\t방어\n...",
+        placeholder="26-09-12 토\t방어\n26-09-14 월\t방어\n...",
     )
     _pasted_now = parse_pasted_mode(mode_paste)
 
     if _pasted_now:
-        # 새로 붙여넣은 값이 있으면 저장(덮어쓰기)하고 그걸 사용
-        save_cached_mode(_pasted_now)
-        _mode_preview = _pasted_now
-        st.success(f"✅ 새로 붙여넣은 {len(_mode_preview)}개 날짜를 서버에 저장하고 적용했습니다.")
-    elif _cached_mode:
+        st.caption(f"방금 붙여넣은 내용에서 {len(_pasted_now)}개 날짜를 인식했습니다. 아래 중 하나를 눌러 저장하세요.")
+        bcol1, bcol2 = st.columns(2)
+        with bcol1:
+            do_merge = st.button(
+                "➕ 추가/갱신 저장 (기존 값 유지 + 겹치는 날짜만 갱신)", use_container_width=True
+            )
+        with bcol2:
+            do_overwrite = st.button(
+                "♻️ 전체 교체 저장 (기존 값 삭제하고 이걸로만 저장)", use_container_width=True
+            )
+        if do_merge:
+            merged = {**(_cached_mode or {}), **_pasted_now}
+            save_cached_mode(merged)
+            st.success(f"✅ {len(_pasted_now)}개 날짜를 추가/갱신했습니다 (전체 {len(merged)}개). ")
+            st.rerun()
+        if do_overwrite:
+            save_cached_mode(_pasted_now)
+            st.success(f"✅ 기존 값을 지우고 {len(_pasted_now)}개 날짜로 새로 저장했습니다.")
+            st.rerun()
+
+    if _cached_mode:
         _mode_preview = _cached_mode
         st.success(f"✅ 저장된 모드값 사용 중 — {len(_mode_preview)}개 날짜 (마지막 저장: {_cached_ts})")
-        if st.button("🗑️ 저장된 모드값 삭제"):
+        if st.button("🗑️ 저장된 모드값 전체 삭제"):
             try:
                 os.remove(MODE_CACHE_PATH)
                 st.rerun()
