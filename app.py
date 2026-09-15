@@ -182,8 +182,21 @@ if data_source == "Yahoo Finance 실시간 조회":
         if err:
             st.sidebar.error(f"⚠️ {err} — 티커/기간을 확인하거나 'CSV 업로드'로 바꿔주세요.")
         else:
-            st.session_state["yf_fetched"] = (df_fetched, n_before, yf_ticker)
-            st.sidebar.success(f"✅ {yf_ticker} {len(df_fetched)-n_before}영업일 시세 로드 완료")
+            visible = df_fetched.iloc[n_before:]
+            actual_first, actual_last = visible["날짜"].iloc[0], visible["날짜"].iloc[-1]
+            st.session_state["yf_fetched"] = (df_fetched, n_before, yf_ticker, yf_start, yf_end)
+            st.sidebar.success(
+                f"✅ {yf_ticker} {len(visible)}영업일 로드 완료 ({actual_first} ~ {actual_last})"
+            )
+            # 요청한 기간과 실제 로드된 첫/마지막 날짜가 크게 다르면(예: 캐시/입력 오류) 바로 알림
+            req_span_days = (yf_end - yf_start).days
+            expected_min_rows = max(5, int(req_span_days * 0.5))  # 대략 주5일 거래 기준 여유있게
+            if req_span_days > 30 and len(visible) < expected_min_rows:
+                st.sidebar.warning(
+                    f"⚠️ 요청 기간({yf_start} ~ {yf_end})에 비해 로드된 영업일 수가 적습니다. "
+                    "위 날짜 입력칸이 실제로 원하는 날짜로 바뀌었는지(연/월/일 모두) 확인 후 "
+                    "'시세 다시 불러오기'를 한 번 더 눌러보세요."
+                )
 
     btn_label = "📡 시세 다시 불러오기" if "yf_fetched" in st.session_state else "📡 시세 불러오기"
     if st.sidebar.button(btn_label, use_container_width=True):
@@ -193,7 +206,12 @@ if data_source == "Yahoo Finance 실시간 조회":
 
     if "yf_fetched" in st.session_state:
         _yf_result = st.session_state["yf_fetched"]
-        st.sidebar.caption(f"현재 로드된 데이터: {_yf_result[2]} ({len(_yf_result[0])-_yf_result[1]}일)")
+        _visible_n = len(_yf_result[0]) - _yf_result[1]
+        _actual_first = _yf_result[0]["날짜"].iloc[_yf_result[1]]
+        _actual_last = _yf_result[0]["날짜"].iloc[-1]
+        st.sidebar.caption(
+            f"현재 로드된 데이터: {_yf_result[2]} ({_visible_n}일, {_actual_first} ~ {_actual_last})"
+        )
 elif data_source == "CSV 업로드":
     price_file = st.sidebar.file_uploader(
         "가격데이터 CSV (열: 날짜,종가)", type=["csv"], key="price_csv"
