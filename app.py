@@ -525,11 +525,10 @@ def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capi
                     t1_delay = True
             pos["_t1_paused_today"] = t1_delay  # 방어모드 전량매도 스윕에서 제외 여부 판단에 재사용
 
-            if expired and (not hit_target or t1_delay):
-                # 만기(MOC)는 목표가 도달 여부와 무관하게 발동. 다만 "목표가 도달 + 1티어 매도보류"가
-                # 겹치는 경우, 매도보류가 막고 있는 상황을 만기가 예외적으로 뚫고 강제청산한다(매뉴얼
-                # "1티어 매도보류(MOC 제외)" 규정 — MOC는 이 보류의 적용 대상에서 제외됨을 의미).
-                # 실제 사이트 로그(01-12 매수 T1 → 01-23 공T1MOC)로 검증된 동작.
+            if expired:
+                # 만기(MOC)는 목표가 도달 여부·1티어 매도보류와 완전히 무관하게 "무조건" 발동한다
+                # (매뉴얼 "n일이 경과하면 MOC주문을 통해서 무조건 청산한다"). 실제 사이트 로그에서
+                # 만기+목표가도달이 겹친 날에도 MOC로 단독 청산되는 게 확인됨(2018-10-30 방T1MOC 등).
                 moc_candidates.append(pos)
             elif hit_target and not t1_delay:
                 loc_candidates.append(pos)
@@ -578,8 +577,13 @@ def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capi
 
         # ---- 2. 매수 판정 -------------------------------------------------
         max_splits = att_splits if mode == "공격" else def_splits
-        curr_tier = len([p for p in open_positions if p["mode"] == mode]) + 1
-        # (티어는 모드별로 별도 관리: 공격 진입중 방어로 바뀌면 방어 티어를 새로 센다)
+        occupied_tiers = {p["tier"] for p in open_positions if p["mode"] == mode}
+        curr_tier = 1
+        while curr_tier in occupied_tiers:
+            curr_tier += 1
+        # (낮은 티어가 먼저 청산되고 높은 티어가 남아있는 경우, 다음 매수는 "비어있는 가장 낮은
+        # 티어 번호"로 들어간다 — 예: 1티어 청산 후 남은 게 2티어뿐이면 다음 매수는 다시 1티어.
+        # 실제 사이트 로그 대조로 확인됨. 티어는 모드별로 별도 관리.)
 
         buy_qty_today = 0
         buy_amount_today = 0.0
