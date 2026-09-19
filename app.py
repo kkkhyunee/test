@@ -499,6 +499,11 @@ def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capi
         cash_at_day_start = cash  # 모드 전환일에는 "그날 매도대금"이 아니라 전일 마감 현금 기준으로
         # 새 모드의 매수 예산을 잡는다(전환일에 한해 검증됨 — 같은 모드 내 매도 당일 재매수는
         # 그날 매도대금을 포함한 현금을 그대로 씀).
+        tiers_at_day_start = {p["tier"] for p in open_positions if p["mode"] == mode}
+        # 티어 슬롯 재사용도 "오늘 매도로 비워진 자리"가 아니라 전일 마감 기준 점유 현황으로 정한다.
+        # 만기청산(MOC)과 같은 날 재매수가 있어도, 그 자리는 당일엔 아직 안 비워진 것으로 취급되어
+        # 다음으로 낮은 빈 번호를 받는다 — 바로 다음날부터 그 번호가 정말로 비게 된다.
+        # (2019-07-25 T1MOC+같은날 매수="공T2" 사례로 검증됨)
 
         # ---- 1. 매도 판정 -------------------------------------------------
         moc_candidates = []   # (pos, forced_reason)
@@ -577,13 +582,9 @@ def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capi
 
         # ---- 2. 매수 판정 -------------------------------------------------
         max_splits = att_splits if mode == "공격" else def_splits
-        occupied_tiers = {p["tier"] for p in open_positions if p["mode"] == mode}
         curr_tier = 1
-        while curr_tier in occupied_tiers:
+        while curr_tier in tiers_at_day_start:
             curr_tier += 1
-        # (낮은 티어가 먼저 청산되고 높은 티어가 남아있는 경우, 다음 매수는 "비어있는 가장 낮은
-        # 티어 번호"로 들어간다 — 예: 1티어 청산 후 남은 게 2티어뿐이면 다음 매수는 다시 1티어.
-        # 실제 사이트 로그 대조로 확인됨. 티어는 모드별로 별도 관리.)
 
         buy_qty_today = 0
         buy_amount_today = 0.0
