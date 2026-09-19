@@ -513,13 +513,16 @@ def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capi
             if pos["mode"] == "공격":
                 target_pct = attack_sell_pct(pos["buy_rsi"], att_sell_min, att_sell_max, att_sell_a)
                 max_hold = attack_hold_days(pos["buy_rsi"], att_hold_min, att_hold_max, att_hold_a)
-                target_price = ceil_2(pos["buy_price"] * (1 + target_pct))
-                hit_target = close >= target_price
+                target_price_raw = pos["buy_price"] * (1 + target_pct)
+                target_price = ceil_2(target_price_raw)  # 표시용(로그)만 반올림
+                hit_target = close >= target_price_raw  # 판정은 반올림 전 원값으로 — 근소한 차이에서
+                # 2자리 반올림 때문에 실제론 도달한 목표가를 놓치는 경우가 있어 원값을 씀
+                # (2017-06-13 사례로 확인: 반올림 시 6.41, 원값 6.4051로 종가 6.406이 원값만 넘음)
                 expired = pos["hold_days"] >= max_hold
             else:
                 sell_p = defense_price(prev_sum_def, def_ma_n, def_sell_cond)
-                target_price = ceil_2(sell_p) if not np.isnan(sell_p) else np.inf
-                hit_target = close >= target_price
+                target_price = ceil_2(sell_p) if not np.isnan(sell_p) else np.inf  # 표시용
+                hit_target = close >= sell_p if not np.isnan(sell_p) else False  # 판정은 원값 기준
                 expired = pos["hold_days"] >= def_max_hold
 
             t1_delay = False
@@ -614,19 +617,21 @@ def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capi
             if mode == "공격":
                 fi = prev_close - prev_prev_close  # Fi = 전일 종가 등락 부호(전전일 대비)
                 if fi >= 0:
-                    buy_limit = floor_2(prev_close * (1 + att_fi_buy_pct / 100.0))
+                    buy_limit_raw = prev_close * (1 + att_fi_buy_pct / 100.0)
                 else:
-                    buy_limit = floor_2(prev_close * (1 + att_fi_neg_pct / 100.0))
+                    buy_limit_raw = prev_close * (1 + att_fi_neg_pct / 100.0)
             else:
                 p1 = defense_price(prev_sum_def, def_ma_n, def_buy_cond1)
                 p2 = prev_close * (1 + def_buy_cond2 / 100.0)
                 cands = [v for v in [p1, p2] if not np.isnan(v)]
-                buy_limit = floor_2(min(cands)) if cands else close
+                buy_limit_raw = min(cands) if cands else close
+            buy_limit = floor_2(buy_limit_raw)  # 표시 및 수량 산정(예산 초과 방지)용 — 내림
             buy_limit_display = buy_limit
 
-            # LOC 매수: 종가가 지정가(buy_limit) 이하일 때만 체결. 수량은 지정가 기준으로 보수적으로
-            # 산정하고(예산 초과 방지), 실제 체결/지불은 그날 종가로 이뤄짐(사이트 로그로 검증됨).
-            fill_ok = close <= buy_limit
+            # LOC 매수: 종가가 지정가 이하일 때만 체결. 체결 여부 판정은 반올림 전 원값 기준
+            # (2자리 반올림 탓에 근소한 차이에서 실제론 체결됐을 매수를 놓치는 걸 방지).
+            # 수량 산정은 내림된 buy_limit 기준으로 보수적으로(예산 초과 방지).
+            fill_ok = close <= buy_limit_raw
 
             if fill_ok and budget > 0 and cash >= 0 and buy_limit > 0:
                 shares = int(budget / (buy_limit * (1 + fee_pct)))
