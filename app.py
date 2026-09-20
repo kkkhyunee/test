@@ -42,6 +42,7 @@ import math
 import io
 import os
 import datetime as _dt
+import requests
 
 st.set_page_config(page_title="2026 SOXL 듀얼스나이퍼 동적 백테스트", layout="wide")
 st.markdown(
@@ -176,19 +177,26 @@ def fetch_stooq_prices(ticker: str, start_iso: str, end_iso: str, lookback_days:
     많아(특히 리버스 스플릿 이력이 있는 레버리지 ETF), Yahoo가 원하는 만큼 과거로 못 갈 때 대안으로
     쓴다. 실패 시 (None, 0, 에러메시지) 반환."""
     try:
-        start_ts = pd.Timestamp(start_iso) - pd.Timedelta(days=lookback_days)
-        end_ts = pd.Timestamp(end_iso)
-        d1 = start_ts.strftime("%Y%m%d")
-        d2 = end_ts.strftime("%Y%m%d")
         symbol = ticker.lower()
         if "." not in symbol:  # 미국 티커는 '.us' 접미사 필요 (예: soxl.us)
             symbol = f"{symbol}.us"
-        url = f"https://stooq.com/q/d/l/?s={symbol}&d1={d1}&d2={d2}&i=d"
-        raw = pd.read_csv(url)
+        # d1/d2로 기간을 지정하면 404가 나는 경우가 있어, 전체 이력을 한 번에 받은 뒤 파이썬에서
+        # 원하는 구간만 잘라낸다. 일부 환경에서 기본 User-Agent를 막길래 브라우저처럼 헤더를 붙인다.
+        url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None, 0, f"Stooq 응답 오류 (HTTP {resp.status_code}) — 티커를 확인해주세요."
+        raw = pd.read_csv(io.StringIO(resp.text))
         if raw is None or raw.empty or "Close" not in raw.columns:
             return None, 0, f"'{ticker}' 티커에 대한 Stooq 데이터를 받아오지 못했습니다."
         raw["Date"] = pd.to_datetime(raw["Date"])
         raw = raw.sort_values("Date").reset_index(drop=True)
+        start_ts = pd.Timestamp(start_iso) - pd.Timedelta(days=lookback_days)
+        end_ts = pd.Timestamp(end_iso)
+        raw = raw[(raw["Date"] >= start_ts) & (raw["Date"] <= end_ts)].reset_index(drop=True)
+        if raw.empty:
+            return None, 0, f"'{ticker}'의 요청 기간({start_iso}~{end_iso}) 데이터가 Stooq에 없습니다."
         df_fetched = pd.DataFrame(
             {"날짜": raw["Date"].apply(_to_kr_date_str), "종가": raw["Close"].astype(float)}
         )
@@ -315,7 +323,51 @@ with tab_mode:
         "계속 이 값을 씁니다. "
         "(Fi값은 넣을 필요 없습니다 — 매수 로직 안에서 자동 계산됩니다.)"
     )
+    st.caption(
+        "⚠️ 이 저장은 서버(배포 인스턴스)의 파일에 저장하는 방식이라, 앱이 재배포되거나 "
+        "한동안 안 쓰여서 잠들었다 깨어나면(Streamlit Cloud 무료 플랜의 정상 동작) 초기화될 수 있습니다. "
+        "아래 '다운로드' 버튼으로 주기적으로 백업해두시고, 초기화됐을 땐 '복원'으로 바로 되살리세요."
+    )
     _cached_mode, _cached_ts = load_cached_mode()
+
+    if _cached_mode:
+        _backup_csv = pd.DataFrame(
+            {"날짜": list(_cached_mode.keys()), "모드": list(_cached_mode.values())}
+        ).to_csv(index=False)
+        st.download_button(
+            "📥 현재 저장된 모드값 다운로드 (백업용)",
+            data=_backup_csv,
+            file_name="mode_backup.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with st.expander("♻️ 백업 파일로 복원하기"):
+        restore_file = st.file_uploader(
+            "다운로드해둔 백업 CSV를 올리면, 아래 버튼으로 서버에 다시 저장할 수 있습니다.",
+            type=["csv"],
+            key="mode_restore_csv",
+        )
+        if restore_file is not None:
+            try:
+                _restored_df = pd.read_csv(restore_file, dtype=str)
+                _restored = dict(zip(_restored_df.iloc[:, 0], _restored_df.iloc[:, 1]))
+                st.caption(f"{len(_restored)}개 날짜를 읽었습니다.")
+                rcol1, rcol2 = st.columns(2)
+                with rcol1:
+                    if st.button("➕ 복원본을 추가/갱신 저장", use_container_width=True, key="restore_merge"):
+                        merged = {**(_cached_mode or {}), **_restored}
+                        save_cached_mode(merged)
+                        st.success(f"✅ 복원 완료 (전체 {len(merged)}개).")
+                        st.rerun()
+                with rcol2:
+                    if st.button("♻️ 복원본으로 전체 교체", use_container_width=True, key="restore_overwrite"):
+                        save_cached_mode(_restored)
+                        st.success(f"✅ 복원 완료 (전체 {len(_restored)}개).")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"파일을 읽지 못했습니다: {e}")
+
     mode_paste = st.text_area(
         "여기에 붙여넣기 (새로 갱신할 날짜만 일부만 붙여넣어도 됩니다 — 아래 '추가/갱신'으로 저장하세요)",
         value="",
