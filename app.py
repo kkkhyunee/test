@@ -126,9 +126,11 @@ def parse_weight_vector(text: str, n_splits: int):
 st.sidebar.markdown("### 📁 데이터 소스")
 data_source = st.sidebar.radio(
     "가격 데이터 소스",
-    ["Yahoo Finance 실시간 조회", "CSV 업로드"],
+    ["Yahoo Finance 실시간 조회", "Stooq (더 긴 과거시세)", "CSV 업로드"],
     index=0,
-    help="기본은 Yahoo Finance 실시간 조회이며, 페이지를 열면 자동으로 한 번 불러옵니다.",
+    help="기본은 Yahoo Finance 실시간 조회이며, 페이지를 열면 자동으로 한 번 불러옵니다. "
+         "Yahoo가 해당 티커의 오래된 과거 시세(예: 리버스 스플릿 이전)를 갖고 있지 않으면 "
+         "Stooq를 대신 써보세요 — 더 긴 이력을 갖고 있는 경우가 많습니다.",
 )
 
 YF_KR_WEEKDAY = ["월", "화", "수", "목", "금", "토", "일"]
@@ -168,23 +170,60 @@ def fetch_yfinance_prices(ticker: str, start_iso: str, end_iso: str, lookback_da
         return None, 0, f"조회 중 오류: {e}"
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_stooq_prices(ticker: str, start_iso: str, end_iso: str, lookback_days: int = 120):
+    """Stooq에서 일별 종가를 받아온다. Yahoo Finance보다 오래된 과거 시세를 갖고 있는 티커가
+    많아(특히 리버스 스플릿 이력이 있는 레버리지 ETF), Yahoo가 원하는 만큼 과거로 못 갈 때 대안으로
+    쓴다. 실패 시 (None, 0, 에러메시지) 반환."""
+    try:
+        start_ts = pd.Timestamp(start_iso) - pd.Timedelta(days=lookback_days)
+        end_ts = pd.Timestamp(end_iso)
+        d1 = start_ts.strftime("%Y%m%d")
+        d2 = end_ts.strftime("%Y%m%d")
+        symbol = ticker.lower()
+        if "." not in symbol:  # 미국 티커는 '.us' 접미사 필요 (예: soxl.us)
+            symbol = f"{symbol}.us"
+        url = f"https://stooq.com/q/d/l/?s={symbol}&d1={d1}&d2={d2}&i=d"
+        raw = pd.read_csv(url)
+        if raw is None or raw.empty or "Close" not in raw.columns:
+            return None, 0, f"'{ticker}' 티커에 대한 Stooq 데이터를 받아오지 못했습니다."
+        raw["Date"] = pd.to_datetime(raw["Date"])
+        raw = raw.sort_values("Date").reset_index(drop=True)
+        df_fetched = pd.DataFrame(
+            {"날짜": raw["Date"].apply(_to_kr_date_str), "종가": raw["Close"].astype(float)}
+        )
+        n_before_start = int((raw["Date"] < pd.Timestamp(start_iso)).sum())
+        return df_fetched, n_before_start, None
+    except Exception as e:
+        return None, 0, f"조회 중 오류: {e}"
+
+
 price_file = None
 _yf_result = None
-if data_source == "Yahoo Finance 실시간 조회":
-    yf_c1, yf_c2, yf_c3 = st.sidebar.columns([1, 1, 1])
-    yf_ticker = yf_c1.text_input("티커", value="SOXL", key="yf_ticker")
-    yf_start = yf_c2.date_input("시작일", value=pd.Timestamp("2026-01-01").date(), key="yf_start")
-    yf_end = yf_c3.date_input("종료일", value=pd.Timestamp.today().date(), key="yf_end")
+if data_source in ("Yahoo Finance 실시간 조회", "Stooq (더 긴 과거시세)"):
+    is_stooq = data_source == "Stooq (더 긴 과거시세)"
+    source_label = "Stooq" if is_stooq else "Yahoo Finance"
+    fetch_fn = fetch_stooq_prices if is_stooq else fetch_yfinance_prices
+    state_key = "stooq_fetched" if is_stooq else "yf_fetched"
 
-    def _do_yf_fetch():
-        with st.spinner(f"{yf_ticker} 시세를 Yahoo Finance에서 불러오는 중..."):
-            df_fetched, n_before, err = fetch_yfinance_prices(yf_ticker, str(yf_start), str(yf_end))
+    yf_c1, yf_c2, yf_c3 = st.sidebar.columns([1, 1, 1])
+    yf_ticker = yf_c1.text_input("티커", value="SOXL", key="yf_ticker" + ("_stooq" if is_stooq else ""))
+    yf_start = yf_c2.date_input(
+        "시작일", value=pd.Timestamp("2026-01-01").date(), key="yf_start" + ("_stooq" if is_stooq else "")
+    )
+    yf_end = yf_c3.date_input(
+        "종료일", value=pd.Timestamp.today().date(), key="yf_end" + ("_stooq" if is_stooq else "")
+    )
+
+    def _do_fetch():
+        with st.spinner(f"{yf_ticker} 시세를 {source_label}에서 불러오는 중..."):
+            df_fetched, n_before, err = fetch_fn(yf_ticker, str(yf_start), str(yf_end))
         if err:
-            st.sidebar.error(f"⚠️ {err} — 티커/기간을 확인하거나 'CSV 업로드'로 바꿔주세요.")
+            st.sidebar.error(f"⚠️ {err} — 티커/기간을 확인하거나 다른 데이터 소스로 바꿔주세요.")
         else:
             visible = df_fetched.iloc[n_before:]
             actual_first, actual_last = visible["날짜"].iloc[0], visible["날짜"].iloc[-1]
-            st.session_state["yf_fetched"] = (df_fetched, n_before, yf_ticker, yf_start, yf_end)
+            st.session_state[state_key] = (df_fetched, n_before, yf_ticker, yf_start, yf_end)
             st.sidebar.success(
                 f"✅ {yf_ticker} {len(visible)}영업일 로드 완료 ({actual_first} ~ {actual_last})"
             )
@@ -194,18 +233,18 @@ if data_source == "Yahoo Finance 실시간 조회":
             if req_span_days > 30 and len(visible) < expected_min_rows:
                 st.sidebar.warning(
                     f"⚠️ 요청 기간({yf_start} ~ {yf_end})에 비해 로드된 영업일 수가 적습니다. "
-                    "위 날짜 입력칸이 실제로 원하는 날짜로 바뀌었는지(연/월/일 모두) 확인 후 "
-                    "'시세 다시 불러오기'를 한 번 더 눌러보세요."
+                    "위 날짜 입력칸이 실제로 원하는 날짜로 바뀌었는지(연/월/일 모두) 확인하거나, "
+                    f"{source_label}가 이 티커의 그 시점 데이터를 갖고 있는지 확인 후 다시 눌러보세요."
                 )
 
-    btn_label = "📡 시세 다시 불러오기" if "yf_fetched" in st.session_state else "📡 시세 불러오기"
+    btn_label = "📡 시세 다시 불러오기" if state_key in st.session_state else "📡 시세 불러오기"
     if st.sidebar.button(btn_label, use_container_width=True):
-        _do_yf_fetch()
-    elif "yf_fetched" not in st.session_state:
-        _do_yf_fetch()  # 페이지를 처음 열었을 때 자동으로 한 번 불러옴
+        _do_fetch()
+    elif state_key not in st.session_state:
+        _do_fetch()  # 페이지를 처음 열었을 때 자동으로 한 번 불러옴
 
-    if "yf_fetched" in st.session_state:
-        _yf_result = st.session_state["yf_fetched"]
+    if state_key in st.session_state:
+        _yf_result = st.session_state[state_key]
         _visible_n = len(_yf_result[0]) - _yf_result[1]
         _actual_first = _yf_result[0]["날짜"].iloc[_yf_result[1]]
         _actual_last = _yf_result[0]["날짜"].iloc[-1]
@@ -335,13 +374,13 @@ if price_file is not None:
     df_price_src = pd.read_csv(price_file)
     df_price_src.columns = ["날짜", "종가"]
     N_WARMUP = 0  # 사용자 CSV는 위밍업 사전 데이터를 역산할 수 없어 그대로 사용(초반 며칠 MA(5)는 NaN일 수 있음)
-elif data_source == "Yahoo Finance 실시간 조회" and _yf_result is not None:
+elif data_source in ("Yahoo Finance 실시간 조회", "Stooq (더 긴 과거시세)") and _yf_result is not None:
     df_price_src, N_WARMUP, _ = _yf_result[0], _yf_result[1], _yf_result[2]
-    # Yahoo Finance는 실제 과거 시세를 갖고 있으므로 앞의 N_WARMUP일이 그대로 진짜 warm-up 데이터가 됨
+    # 실시간 조회는 실제 과거 시세를 갖고 있으므로 앞의 N_WARMUP일이 그대로 진짜 warm-up 데이터가 됨
 else:
     st.error(
         "⚠️ 가격 데이터를 아직 불러오지 못했습니다. 사이드바에서 '📡 시세 불러오기'를 눌러 "
-        "Yahoo Finance 조회를 다시 시도하거나, 'CSV 업로드'로 바꿔서 직접 올려주세요."
+        "다시 시도하거나, 다른 데이터 소스(Stooq / CSV 업로드)로 바꿔주세요."
     )
     st.stop()
 
