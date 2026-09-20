@@ -187,9 +187,13 @@ def fetch_stooq_prices(ticker: str, start_iso: str, end_iso: str, lookback_days:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code != 200:
             return None, 0, f"Stooq 응답 오류 (HTTP {resp.status_code}) — 티커를 확인해주세요."
-        raw = pd.read_csv(io.StringIO(resp.text))
+        body_preview = resp.text.strip()[:200]
+        try:
+            raw = pd.read_csv(io.StringIO(resp.text))
+        except Exception:
+            return None, 0, f"Stooq 응답을 표로 못 읽었습니다. 응답 내용: {body_preview}"
         if raw is None or raw.empty or "Close" not in raw.columns:
-            return None, 0, f"'{ticker}' 티커에 대한 Stooq 데이터를 받아오지 못했습니다."
+            return None, 0, f"'{ticker}' 티커에 대한 Stooq 데이터를 받아오지 못했습니다. 응답 내용: {body_preview}"
         raw["Date"] = pd.to_datetime(raw["Date"])
         raw = raw.sort_values("Date").reset_index(drop=True)
         start_ts = pd.Timestamp(start_iso) - pd.Timedelta(days=lookback_days)
