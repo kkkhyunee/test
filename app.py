@@ -270,7 +270,9 @@ elif data_source == "CSV 업로드":
 
 st.sidebar.caption("🔒 모드값(공격/방어) 붙여넣기는 상단 **'모드값 입력'** 탭에서 합니다.")
 
-tab_dash, tab_log, tab_mode = st.tabs(["📊 대시보드", "📝 매매로그", "🔒 모드값 입력"])
+tab_dash, tab_log, tab_order, tab_mode = st.tabs(
+    ["📊 대시보드", "📝 매매로그", "📋 주문표", "🔒 모드값 입력"]
+)
 
 
 def parse_pasted_mode(text: str):
@@ -816,7 +818,121 @@ def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capi
     for col in ["매수량", "매도량", "평단가", "매수조건", "매수할당", "매수티어", "보유"]:
         df_hist[col] = df_hist[col].astype(str)
     df_trades = pd.DataFrame(trades)
-    return df_hist, df_trades
+    return df_hist, df_trades, open_positions, cash
+
+
+def compute_pending_orders(df_base_full: pd.DataFrame, last_idx: int, open_positions: list, cash: float, next_mode: str):
+    """로드된 시세의 마지막 날(last_idx)을 '오늘'로 보고, 다음 거래일에 낼 주문을 계산한다.
+    실제 체결 로그가 아니라 지금까지의 보유상태를 그대로 이어받은 시뮬레이션 기준 주문표."""
+    d0_close = df_base_full.loc[last_idx, "종가"]
+    d0_ma5 = df_base_full.loc[last_idx, "MA(5)"]
+    d0_ma5 = d0_close if pd.isna(d0_ma5) else d0_ma5
+    d1_close = df_base_full.loc[last_idx - 1, "종가"] if last_idx > 0 else d0_close
+
+    n_needed = max(def_ma_n - 1, 1)
+    start_pos = max(0, last_idx - n_needed + 1)
+    next_day_prev_sum = df_base_full["종가"].iloc[start_pos : last_idx + 1].sum()
+
+    t1_paused = apply_t1_hold and (d0_close > d0_ma5)
+
+    orders = []  # 표에 그대로 넣을 딕셔너리 리스트
+
+    # ---- 매도 주문 (보유 중인 포지션 평가) ----
+    moc_list, loc_list = [], []
+    for pos in open_positions:
+        next_hold_days = pos["hold_days"] + 1
+        if pos["mode"] == "공격":
+            max_hold = attack_hold_days(pos["buy_rsi"], att_hold_min, att_hold_max, att_hold_a)
+            target_pct = attack_sell_pct(pos["buy_rsi"], att_sell_min, att_sell_max, att_sell_a)
+            target_price = ceil_2(pos["buy_price"] * (1 + target_pct))
+        else:
+            sell_p = defense_price(next_day_prev_sum, def_ma_n, def_sell_cond)
+            max_hold = def_max_hold
+            target_price = ceil_2(sell_p) if not np.isnan(sell_p) else None
+        expired = next_hold_days >= max_hold
+        paused_this = apply_t1_hold and pos["tier"] == 1 and t1_paused
+        if expired:
+            moc_list.append(pos)
+        elif not paused_this and target_price is not None:
+            loc_list.append((pos, target_price))
+
+    if moc_list:
+        for pos in moc_list:
+            orders.append(
+                {
+                    "구분": "매도",
+                    "주문방법": "MOC",
+                    "주문가": "시장가",
+                    "티어": f"{pos['mode'][0]}T{pos['tier']}",
+                    "수량": pos["shares"],
+                    "참고": f"만기청산(보유 {pos['hold_days']+1}일차)",
+                }
+            )
+    else:
+        for pos, tp in loc_list:
+            orders.append(
+                {
+                    "구분": "매도",
+                    "주문방법": "LOC",
+                    "주문가": tp,
+                    "티어": f"{pos['mode'][0]}T{pos['tier']}",
+                    "수량": pos["shares"],
+                    "참고": "목표가 도달 시 체결",
+                }
+            )
+        if apply_t1_hold and t1_paused and any(p["tier"] == 1 for p in open_positions):
+            orders.append(
+                {
+                    "구분": "-",
+                    "주문방법": "-",
+                    "주문가": "-",
+                    "티어": "T1",
+                    "수량": "-",
+                    "참고": "1티어 매도보류(전일종가>전일MA5)",
+                }
+            )
+
+    # ---- 매수 주문 ----
+    max_splits = att_splits if next_mode == "공격" else def_splits
+    occupied = {p["tier"] for p in open_positions if p["mode"] == next_mode}
+    curr_tier = 1
+    while curr_tier in occupied:
+        curr_tier += 1
+
+    if curr_tier <= max_splits:
+        weights = [1.0 / att_splits] * att_splits if next_mode == "공격" else parse_weight_vector(
+            def_weight_text, def_splits
+        )
+        remaining_weight_sum = sum(weights[curr_tier - 1 :])
+        next_weight = weights[curr_tier - 1] if curr_tier - 1 < len(weights) else weights[-1]
+        budget = cash * (next_weight / remaining_weight_sum) if remaining_weight_sum > 0 else 0
+
+        if next_mode == "공격":
+            fi = d0_close - d1_close
+            if fi >= 0:
+                buy_limit = floor_2(d0_close * (1 + att_fi_buy_pct / 100.0))
+            else:
+                buy_limit = floor_2(d0_close * (1 + att_fi_neg_pct / 100.0))
+        else:
+            p1 = defense_price(next_day_prev_sum, def_ma_n, def_buy_cond1)
+            p2 = d0_close * (1 + def_buy_cond2 / 100.0)
+            cands = [v for v in [p1, p2] if not np.isnan(v)]
+            buy_limit = floor_2(min(cands)) if cands else d0_close
+
+        est_shares = int(budget / (buy_limit * (1 + fee_pct))) if buy_limit > 0 else 0
+        pct_vs_close = (buy_limit - d0_close) / d0_close * 100 if d0_close else 0
+        orders.append(
+            {
+                "구분": "매수",
+                "주문방법": "LOC",
+                "주문가": buy_limit,
+                "티어": f"{next_mode[0]}T{curr_tier}",
+                "수량": est_shares,
+                "참고": f"전일 종가 대비 {pct_vs_close:+.2f}%",
+            }
+        )
+
+    return orders, t1_paused
 
 
 # ────────────────────────────────────────────────────────────────
@@ -825,7 +941,17 @@ def run_backtest(df_full: pd.DataFrame, start_idx: int, end_idx: int, start_capi
 s_idx = all_dates.index(start_date) + N_WARMUP
 e_idx = all_dates.index(end_date) + N_WARMUP
 
-df_result, df_trades = run_backtest(df_base, s_idx, e_idx, init_cap)
+df_result, df_trades, _final_open_positions, _final_cash = run_backtest(df_base, s_idx, e_idx, init_cap)
+
+# 실전 계좌용: 화면에 표시할 기간(종료일)과 무관하게, 항상 "로드된 시세의 마지막 날"까지
+# 같은 시작일로 다시 돌려서 현재 보유 상태와 다음 주문을 계산한다.
+_last_idx = len(df_base) - 1
+if _last_idx > e_idx:
+    _live_result, _live_trades, _live_open_positions, _live_cash = run_backtest(
+        df_base, s_idx, _last_idx, init_cap
+    )
+else:
+    _live_result, _live_open_positions, _live_cash = df_result, _final_open_positions, _final_cash
 
 # ---- 지표 계산 -------------------------------------------------------
 final_eq = float(df_result["총자산"].iloc[-1])
@@ -942,4 +1068,73 @@ with tab_log:
         "(모드 판정에만 쓰이는 값이라 '모드값 입력' 탭으로 대체 가능)."
     )
     st.dataframe(df_result, use_container_width=True, hide_index=True, height=700)
+
+# ---- 📋 주문표 탭 -------------------------------------------------------
+with tab_order:
+    _last_date_label = df_base.loc[_last_idx, "날짜"]
+    st.markdown(f"### 📋 다음 주문표 (기준일: {_last_date_label} 종가)")
+    st.caption(
+        "실제 체결 로그가 아니라, 지금까지의 보유상태를 그대로 이어받아 계산한 시뮬레이션 주문표입니다. "
+        "사이드바의 시작 자본금·수수료·파라미터와 '백테스트 기간 설정'의 **시작일**을 실전 계좌의 시작일로 "
+        "그대로 사용합니다(종료일은 이 탭에서는 무시하고 항상 최신 시세까지 계산합니다)."
+    )
+
+    _mode_c1, _mode_c2 = st.columns([1, 2])
+    with _mode_c1:
+        _mode_options = ["자동판정(종가 vs MA20)", "공격", "방어"]
+        _auto_mode_guess = determine_mode(
+            _last_date_label, df_base.loc[_last_idx, "종가"], df_base.loc[_last_idx, "MA(20)"]
+        )
+        _next_mode_choice = st.selectbox("다음 거래일 모드", _mode_options, index=0)
+    if _next_mode_choice == "자동판정(종가 vs MA20)":
+        _next_mode = _auto_mode_guess
+        st.caption(f"자동판정 결과: **{_next_mode}** (모드 전환 조건은 비공개라 근사치입니다 — 확실하면 직접 선택하세요)")
+    else:
+        _next_mode = _next_mode_choice
+
+    _orders, _t1_paused_flag = compute_pending_orders(
+        df_base, _last_idx, _live_open_positions, _live_cash, _next_mode
+    )
+
+    _holdings_val = sum(p["shares"] * df_base.loc[_last_idx, "종가"] for p in _live_open_positions)
+    _total_val = _live_cash + _holdings_val
+    _stock_pct = _holdings_val / _total_val * 100 if _total_val > 0 else 0
+    _cash_pct = 100 - _stock_pct
+
+    scol1, scol2, scol3 = st.columns(3)
+    scol1.metric("보유 주식 수량", f"{sum(p['shares'] for p in _live_open_positions):,}주")
+    scol2.metric("보유 비중", f"주식 {_stock_pct:.0f}% / 현금 {_cash_pct:.0f}%")
+    scol3.metric("현금", f"${_live_cash:,.2f}")
+
+    st.markdown("---")
+    if _orders:
+        _orders_df = pd.DataFrame(_orders)
+        for _c in ["주문가", "수량"]:
+            _orders_df[_c] = _orders_df[_c].astype(str)
+        st.dataframe(_orders_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("다음 거래일에 낼 주문이 없습니다(보유 포지션 없음, 신규 매수 조건도 없음).")
+
+    with st.expander("현재 보유 포지션 상세"):
+        if _live_open_positions:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "티어": f"{p['mode'][0]}T{p['tier']}",
+                            "모드": p["mode"],
+                            "수량": p["shares"],
+                            "매입가": p["buy_price"],
+                            "매수시 RSI": round(p["buy_rsi"], 1),
+                            "보유일차": p["hold_days"],
+                        }
+                        for p in _live_open_positions
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("보유 중인 포지션이 없습니다.")
+
 
