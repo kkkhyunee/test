@@ -942,16 +942,7 @@ s_idx = all_dates.index(start_date) + N_WARMUP
 e_idx = all_dates.index(end_date) + N_WARMUP
 
 df_result, df_trades, _final_open_positions, _final_cash = run_backtest(df_base, s_idx, e_idx, init_cap)
-
-# 실전 계좌용: 화면에 표시할 기간(종료일)과 무관하게, 항상 "로드된 시세의 마지막 날"까지
-# 같은 시작일로 다시 돌려서 현재 보유 상태와 다음 주문을 계산한다.
-_last_idx = len(df_base) - 1
-if _last_idx > e_idx:
-    _live_result, _live_trades, _live_open_positions, _live_cash = run_backtest(
-        df_base, s_idx, _last_idx, init_cap
-    )
-else:
-    _live_result, _live_open_positions, _live_cash = df_result, _final_open_positions, _final_cash
+_last_idx = len(df_base) - 1  # 주문표 탭에서 "오늘"로 쓰는, 로드된 시세의 마지막 행
 
 # ---- 지표 계산 -------------------------------------------------------
 final_eq = float(df_result["총자산"].iloc[-1])
@@ -1071,13 +1062,67 @@ with tab_log:
 
 # ---- 📋 주문표 탭 -------------------------------------------------------
 with tab_order:
+    st.markdown("### 💰 실전 계좌 설정")
+    st.caption(
+        "백테스트 탭과는 별개로, 여기서 넣은 투자금·시작일·수수료로 지금까지 쭉 이어온 걸로 치고 "
+        "'다음 주문표'를 계산합니다. 전략 파라미터(공격/방어 분할수·조건 등)는 사이드바 값을 그대로 씁니다."
+    )
+
+    _acct_min_d, _acct_max_d = all_dates_real[0], all_dates_real[-1]
+    _acct_default = st.session_state.get("acct_settings", {})
+
+    with st.form("acct_form"):
+        acol1, acol2, acol3 = st.columns(3)
+        with acol1:
+            acct_capital = st.number_input(
+                "초기 자산 ($)", value=_acct_default.get("capital", 10000), step=1000, min_value=1
+            )
+        with acol2:
+            acct_start_picked = st.date_input(
+                "시작일",
+                value=_acct_default.get("start", _acct_min_d),
+                min_value=_acct_min_d,
+                max_value=_acct_max_d,
+            )
+        with acol3:
+            acct_fee = st.number_input(
+                "거래 수수료 (%)", value=_acct_default.get("fee", 0.07), step=0.01, min_value=0.0
+            )
+        acct_submitted = st.form_submit_button("🧮 주문표 계산", use_container_width=True)
+
+    if acct_submitted or "acct_settings" not in st.session_state:
+        _snapped = acct_start_picked if acct_start_picked in date_to_label else _snap(acct_start_picked, forward=True)
+        st.session_state["acct_settings"] = {
+            "capital": acct_capital,
+            "start": acct_start_picked,
+            "fee": acct_fee,
+            "start_label": date_to_label[_snapped],
+        }
+    _acct = st.session_state["acct_settings"]
+
+    _acct_s_idx = all_dates_real.index(
+        label_to_date(_acct["start_label"])
+    ) + N_WARMUP if label_to_date(_acct["start_label"]) in all_dates_real else s_idx
+    # (all_dates_real는 워밍업 제외 목록이므로 N_WARMUP을 더해 df_base 절대 인덱스로 변환)
+
+    _orig_fee_pct = fee_pct
+    fee_pct = _acct["fee"] / 100.0  # run_backtest가 전역 fee_pct를 참조하므로 계좌용으로 잠깐 바꿔치기
+    _acct_result, _acct_trades, _live_open_positions, _live_cash = run_backtest(
+        df_base, _acct_s_idx, _last_idx, _acct["capital"]
+    )
+    fee_pct = _orig_fee_pct  # 원래 값(백테스트 탭용)으로 복원
+
+    st.caption(
+        f"계좌 시작일: {_acct['start_label']} · 초기 자산: ${_acct['capital']:,.0f} · "
+        f"수수료: {_acct['fee']}% · 현재 총자산: ${_acct_result['총자산'].iloc[-1]:,.2f} "
+        f"(누적수익률 {_acct_result['누적수익률'].iloc[-1]})"
+    )
+
+    st.markdown("---")
+
     _last_date_label = df_base.loc[_last_idx, "날짜"]
     st.markdown(f"### 📋 다음 주문표 (기준일: {_last_date_label} 종가)")
-    st.caption(
-        "실제 체결 로그가 아니라, 지금까지의 보유상태를 그대로 이어받아 계산한 시뮬레이션 주문표입니다. "
-        "사이드바의 시작 자본금·수수료·파라미터와 '백테스트 기간 설정'의 **시작일**을 실전 계좌의 시작일로 "
-        "그대로 사용합니다(종료일은 이 탭에서는 무시하고 항상 최신 시세까지 계산합니다)."
-    )
+    st.caption("실제 체결 로그가 아니라, 위 계좌 설정을 그대로 이어받아 계산한 시뮬레이션 주문표입니다.")
 
     _mode_c1, _mode_c2 = st.columns([1, 2])
     with _mode_c1:
@@ -1092,9 +1137,11 @@ with tab_order:
     else:
         _next_mode = _next_mode_choice
 
+    fee_pct = _acct["fee"] / 100.0
     _orders, _t1_paused_flag = compute_pending_orders(
         df_base, _last_idx, _live_open_positions, _live_cash, _next_mode
     )
+    fee_pct = _orig_fee_pct
 
     _holdings_val = sum(p["shares"] * df_base.loc[_last_idx, "종가"] for p in _live_open_positions)
     _total_val = _live_cash + _holdings_val
@@ -1136,5 +1183,6 @@ with tab_order:
             )
         else:
             st.caption("보유 중인 포지션이 없습니다.")
+
 
 
