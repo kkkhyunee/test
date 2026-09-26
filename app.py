@@ -554,7 +554,42 @@ df_base["방어_직전합"] = df_base["종가"].shift(1).rolling(window=max(def_
 # ────────────────────────────────────────────────────────────────
 # 5. 백테스트 엔진
 # ────────────────────────────────────────────────────────────────
+def _build_weekly_mode_map(df_full: pd.DataFrame) -> dict:
+    """모드는 그 주 첫 거래일(보통 월요일)에 한 번 정해지면, 그 주 금요일까지 그대로 유지된다.
+    - 붙여넣은 모드값이 그 주 어느 날짜에든 있으면 그 값을 그 주 전체에 적용(가장 이른 날짜 우선).
+    - 없으면 그 주 첫 거래일의 종가 vs MA20으로 자동판정해서 그 주 전체에 적용."""
+    weeks: dict = {}
+    for i in range(len(df_full)):
+        date_label = df_full.loc[i, "날짜"]
+        wk = label_to_date(date_label).isocalendar()[:2]  # (연도, ISO 주차)
+        weeks.setdefault(wk, []).append(i)
+
+    mode_map = {}
+    for wk, idxs in weeks.items():
+        week_mode = None
+        if use_pasted_mode and mode_override:
+            for i in idxs:
+                dl = df_full.loc[i, "날짜"]
+                if dl in mode_override:
+                    week_mode = mode_override[dl]
+                    break
+        if week_mode is None:
+            first_i = idxs[0]
+            close0 = df_full.loc[first_i, "종가"]
+            ma20_0 = df_full.loc[first_i, "MA(20)"]
+            week_mode = "공격" if (not np.isnan(ma20_0) and close0 >= ma20_0) else "방어"
+        for i in idxs:
+            mode_map[df_full.loc[i, "날짜"]] = week_mode
+    return mode_map
+
+
+_weekly_mode_map = _build_weekly_mode_map(df_base)
+
+
 def determine_mode(date, close, ma20):
+    if date in _weekly_mode_map:
+        return _weekly_mode_map[date]
+    # df_base 범위 밖(미래) 날짜 등 예외적인 경우의 폴백
     if use_pasted_mode and mode_override and date in mode_override:
         return mode_override[date]
     return "공격" if (not np.isnan(ma20) and close >= ma20) else "방어"
@@ -1126,14 +1161,30 @@ with tab_order:
 
     _mode_c1, _mode_c2 = st.columns([1, 2])
     with _mode_c1:
-        _mode_options = ["자동판정(종가 vs MA20)", "공격", "방어"]
-        _auto_mode_guess = determine_mode(
-            _last_date_label, df_base.loc[_last_idx, "종가"], df_base.loc[_last_idx, "MA(20)"]
-        )
+        _mode_options = ["자동판정(주 단위 유지)", "공격", "방어"]
+        _last_weekday = label_to_date(_last_date_label).weekday()  # 0=월 ... 4=금
+        _is_new_week_next = _last_weekday == 4  # 금요일 다음 거래일은 보통 새로운 주(월요일)
+        if _is_new_week_next:
+            # 다음 주 월요일의 실제 모드는 아직 알 수 없어, 기준일(금요일) 종가 vs MA20으로 근사
+            _auto_mode_guess = "공격" if (
+                not np.isnan(df_base.loc[_last_idx, "MA(20)"])
+                and df_base.loc[_last_idx, "종가"] >= df_base.loc[_last_idx, "MA(20)"]
+            ) else "방어"
+        else:
+            # 이번 주 안이면 이번 주에 이미 정해진 모드를 그대로 유지(월~금 동일 규칙)
+            _auto_mode_guess = determine_mode(
+                _last_date_label, df_base.loc[_last_idx, "종가"], df_base.loc[_last_idx, "MA(20)"]
+            )
         _next_mode_choice = st.selectbox("다음 거래일 모드", _mode_options, index=0)
-    if _next_mode_choice == "자동판정(종가 vs MA20)":
+    if _next_mode_choice == "자동판정(주 단위 유지)":
         _next_mode = _auto_mode_guess
-        st.caption(f"자동판정 결과: **{_next_mode}** (모드 전환 조건은 비공개라 근사치입니다 — 확실하면 직접 선택하세요)")
+        if _is_new_week_next:
+            st.caption(
+                f"자동판정 결과: **{_next_mode}** — 다음 거래일이 새로운 주(월요일)라 아직 실제 모드를 "
+                "알 수 없어 기준일 종가 기준으로 근사했습니다. 실제 값을 아시면 직접 선택하세요."
+            )
+        else:
+            st.caption(f"자동판정 결과: **{_next_mode}** (이번 주에 이미 정해진 모드를 그대로 유지 — 월~금 동일)")
     else:
         _next_mode = _next_mode_choice
 
